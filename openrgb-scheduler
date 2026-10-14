@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+CONF="$HOME/.config/openrgb_schedule.conf"
+STATE="/tmp/openrgb_current_profile_${USER}"
+mkdir -p "$HOME/.config"
+
+find_orp_files() {
+    find "$HOME/.config/OpenRGB" "$HOME/.var/app/org.openrgb.OpenRGB/config/OpenRGB" \
+        -maxdepth 1 -name "*.orp" -printf "%f\n" 2>/dev/null | sed 's/\.orp$//' | sort -u
+}
+
+run_openrgb() {
+    if command -v openrgb >/dev/null 2>&1; then
+        openrgb --noautoconnect --profile "$1" >/dev/null 2>&1
+    elif flatpak info org.openrgb.OpenRGB >/dev/null 2>&1; then
+        flatpak run org.openrgb.OpenRGB --noautoconnect --profile "$1" >/dev/null 2>&1
+    fi
+}
+
+if [[ ! -f "$CONF" ]]; then
+    FIRST_PROF=$(find_orp_files | head -n 1)
+    [[ -z "$FIRST_PROF" ]] && FIRST_PROF="Default"
+    cat << INIT > "$CONF"
+08:00|$FIRST_PROF
+21:00|$FIRST_PROF
+INIT
+fi
+
+sort_conf() {
+    grep -v '^[[:space:]]*$' "$CONF" | sort -t '|' -k1,1 > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+}
+sort_conf
+
+get_profiles() {
+    local current_first="$1"
+    local list=()
+    [[ -n "$current_first" ]] && list+=("$current_first")
+
+    while IFS= read -r prof; do
+        [[ -n "$prof" && "$prof" != "$current_first" ]] && list+=("$prof")
+    done < <(find_orp_files)
+
+    if [[ ${#list[@]} -eq 0 ]]; then
+        list=("Default")
+    fi
+
+    local IFS='|'
+    echo "${list[*]}"
+}
+
+if [[ "$1" == "--gui" ]]; then
+    while true; do
+        MENU_ITEMS=()
+        while IFS='|' read -r t p; do
+            [[ -z "$t" ]] && continue
+            MENU_ITEMS+=("$t" "$p")
+        done < "$CONF"
+
+        CHOICE=$(zenity --list \
+            --title="OpenRGB Schedule Manager" \
+            --text="💡 Tip: Double-click a time slot to Edit/Delete, or double-click an action below to run it." \
+            --width=500 --height=430 \
+            --column="Start Time (24h)" --column="OpenRGB Profile" \
+            "${MENU_ITEMS[@]}" \
+            "➕ Add New Slot" "Double-click to create a new time transition" \
+            "✅ Save & Apply Now" "Double-click to apply lighting and exit")
+
+        if [[ -z "$CHOICE" ]]; then
+            rm -f "$STATE"
+            break
+        elif [[ "$CHOICE" == "✅ Save & Apply Now" ]]; then
+            rm -f "$STATE"
+            break
+        elif [[ "$CHOICE" == "➕ Add New Slot" ]]; then
+            PROF_LIST=$(get_profiles "")
+            NEW_ENTRY=$(zenity --forms --title="Add Time Slot" \
+                --text="Enter a 24-hour time and pick a saved OpenRGB profile:" \
+                --add-entry="Start Time (HH:MM, e.g. 07:30):" \
+                --add-combo="Select Profile:" --combo-values="$PROF_LIST")
+
+            if [[ -n "$NEW_ENTRY" ]]; then
+                NT=$(echo "$NEW_ENTRY" | cut -d'|' -f1 | tr -d ' ')
+                NP=$(echo "$NEW_ENTRY" | cut -d'|' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [[ "$NT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ && -n "$NP" ]]; then
+                    [[ ${#NT} -eq 4 ]] && NT="0$NT"
+                    grep -v "^${NT}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+                    echo "${NT}|${NP}" >> "$CONF"
+                    sort_conf
+                else
+                    zenity --error --text="Invalid format! Enter a 24-hour time (HH:MM) and select a profile."
+                fi
+            fi
+        else
+            CUR_PROF=$(grep "^${CHOICE}|" "$CONF" | head -n1 | cut -d'|' -f2)
+            ACTION=$(zenity --question --title="Manage Slot ($CHOICE)" \
+                --text="Selected Slot: $CHOICE -> $CUR_PROF\n\nWhat would you like to do?" \
+                --ok-label="Edit Slot" \
+                --cancel-label="Cancel" \
+                --extra-button="Delete Slot")
+
+            RET=$?
+            if [[ "$ACTION" == "Delete Slot" ]]; then
+                grep -v "^${CHOICE}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+            elif [[ $RET -eq 0 ]]; then
+                PROF_LIST=$(get_profiles "$CUR_PROF")
+                EDIT_ENTRY=$(zenity --forms --title="Edit Slot ($CHOICE)" \
+                    --text="Update the start time (leave blank to keep $CHOICE) or select a profile:" \
+                    --add-entry="New Start Time ($CHOICE):" \
+                    --add-combo="Select Profile (Current: $CUR_PROF):" --combo-values="$PROF_LIST")
+
+                if [[ -n "$EDIT_ENTRY" ]]; then
+                    NT=$(echo "$EDIT_ENTRY" | cut -d'|' -f1 | tr -d ' ')
+                    NP=$(echo "$EDIT_ENTRY" | cut -d'|' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    [[ -z "$NT" ]] && NT="$CHOICE"
+                    [[ -z "$NP" ]] && NP="$CUR_PROF"
+                    if [[ "$NT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+                        [[ ${#NT} -eq 4 ]] && NT="0$NT"
+                        grep -v "^${CHOICE}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+                        echo "${NT}|${NP}" >> "$CONF"
+                        sort_conf
+                    else
+                        zenity --error --text="Invalid time format! Must be HH:MM."
+                    fi
+                fi
+            fi
+        fi
+    done
+fi
+
+to_int() { echo "$((10#${1//[^0-9]/}))"; }
+
+if [[ -n "$1" && "$1" != "--gui" ]]; then
+    NOW=$(to_int "$1")
+    rm -f "$STATE"
+else
+    NOW=$((10#$(date +%H%M)))
+fi
+
+PROFILE=$(tail -n 1 "$CONF" | cut -d'|' -f2)
+
+while IFS='|' read -r t p; do
+    [[ -z "$t" ]] && continue
+    SLOT_TIME=$(to_int "$t")
+    if (( NOW >= SLOT_TIME )); then
+        PROFILE="$p"
+    fi
+done < "$CONF"
+
+[[ -z "$PROFILE" ]] && exit 0
+
+if [[ -n "$1" && "$1" != "--gui" ]]; then
+    echo "Time evaluated: $1 -> Selected Profile: $PROFILE"
+fi
+
+LAST_PROFILE=$(cat "$STATE" 2>/dev/null)
+[[ "$PROFILE" == "$LAST_PROFILE" ]] && exit 0
+
+run_openrgb "$PROFILE"
+echo "$PROFILE" > "$STATE"
