@@ -17,17 +17,21 @@ run_openrgb() {
     fi
 }
 
+# 1. Initialize or Auto-Upgrade Config
 if [[ ! -f "$CONF" ]]; then
     FIRST_PROF=$(find_orp_files | head -n 1)
     [[ -z "$FIRST_PROF" ]] && FIRST_PROF="Default"
     cat << INIT > "$CONF"
-08:00|$FIRST_PROF
-21:00|$FIRST_PROF
+Everyday|08:00|$FIRST_PROF
+Everyday|21:00|$FIRST_PROF
 INIT
 fi
 
+# Auto-upgrade old configs missing the "Days" column
+sed -i -E 's/^([0-9]{2}:[0-9]{2})\|(.*)$/Everyday|\1|\2/' "$CONF"
+
 sort_conf() {
-    grep -v '^[[:space:]]*$' "$CONF" | sort -t '|' -k1,1 > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+    grep -v '^[[:space:]]*$' "$CONF" | sort -t'|' -k2,2 > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
 }
 sort_conf
 
@@ -40,86 +44,99 @@ get_profiles() {
         [[ -n "$prof" && "$prof" != "$current_first" ]] && list+=("$prof")
     done < <(find_orp_files)
 
-    if [[ ${#list[@]} -eq 0 ]]; then
-        list=("Default")
-    fi
-
+    [[ ${#list[@]} -eq 0 ]] && list=("Default")
+    
     local IFS='|'
     echo "${list[*]}"
 }
 
+# 2. Interactive GUI Manager
 if [[ "$1" == "--gui" ]]; then
     while true; do
         MENU_ITEMS=()
-        while IFS='|' read -r t p; do
-            [[ -z "$t" ]] && continue
-            MENU_ITEMS+=("$t" "$p")
+        while IFS='|' read -r d t p; do
+            [[ -z "$d" ]] && continue
+            MENU_ITEMS+=("${d} @ ${t}" "$p")
         done < "$CONF"
 
         CHOICE=$(zenity --list \
             --title="OpenRGB Schedule Manager" \
-            --text="💡 Tip: Double-click a time slot to Edit/Delete, or double-click an action below to run it." \
-            --width=500 --height=430 \
-            --column="Start Time (24h)" --column="OpenRGB Profile" \
+            --text="💡 Tip: Double-click a time slot to Edit/Delete, or an action below to run it." \
+            --width=550 --height=450 \
+            --column="Schedule (Day @ Time)" --column="OpenRGB Profile" \
             "${MENU_ITEMS[@]}" \
-            "➕ Add New Slot" "Double-click to create a new time transition" \
-            "✅ Save & Apply Now" "Double-click to apply lighting and exit")
+            "=========================" "===" \
+            "➕ Add New Slot" "Create a new rule" \
+            "✅ Save & Apply Now" "Apply and exit")
 
-        if [[ -z "$CHOICE" ]]; then
+        if [[ -z "$CHOICE" || "$CHOICE" == "✅ Save & Apply Now" ]]; then
             rm -f "$STATE"
             break
-        elif [[ "$CHOICE" == "✅ Save & Apply Now" ]]; then
-            rm -f "$STATE"
-            break
+        elif [[ "$CHOICE" == *"==="* || "$CHOICE" == *"==="* ]]; then
+            continue
         elif [[ "$CHOICE" == "➕ Add New Slot" ]]; then
             PROF_LIST=$(get_profiles "")
+            DAY_LIST="Everyday|Weekdays (Mon-Fri)|Weekends (Sat-Sun)|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday"
+            
             NEW_ENTRY=$(zenity --forms --title="Add Time Slot" \
-                --text="Enter a 24-hour time and pick a saved OpenRGB profile:" \
-                --add-entry="Start Time (HH:MM, e.g. 07:30):" \
+                --text="Set the days, time, and profile:" \
+                --add-combo="Active Days:" --combo-values="$DAY_LIST" \
+                --add-entry="Start Time (HH:MM):" \
                 --add-combo="Select Profile:" --combo-values="$PROF_LIST")
 
             if [[ -n "$NEW_ENTRY" ]]; then
-                NT=$(echo "$NEW_ENTRY" | cut -d'|' -f1 | tr -d ' ')
-                NP=$(echo "$NEW_ENTRY" | cut -d'|' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                if [[ "$NT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ && -n "$NP" ]]; then
+                ND=$(echo "$NEW_ENTRY" | cut -d'|' -f1)
+                NT=$(echo "$NEW_ENTRY" | cut -d'|' -f2 | tr -d ' ')
+                NP=$(echo "$NEW_ENTRY" | cut -d'|' -f3 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                
+                if [[ "$NT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ && -n "$NP" && -n "$ND" ]]; then
                     [[ ${#NT} -eq 4 ]] && NT="0$NT"
-                    grep -v "^${NT}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
-                    echo "${NT}|${NP}" >> "$CONF"
+                    grep -v "^${ND}|${NT}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+                    echo "${ND}|${NT}|${NP}" >> "$CONF"
                     sort_conf
                 else
-                    zenity --error --text="Invalid format! Enter a 24-hour time (HH:MM) and select a profile."
+                    zenity --error --text="Invalid format! Check your inputs."
                 fi
             fi
-        else
-            CUR_PROF=$(grep "^${CHOICE}|" "$CONF" | head -n1 | cut -d'|' -f2)
-            ACTION=$(zenity --question --title="Manage Slot ($CHOICE)" \
-                --text="Selected Slot: $CHOICE -> $CUR_PROF\n\nWhat would you like to do?" \
+        elif [[ -n "$CHOICE" ]]; then
+            # Parse the combined "Day @ Time" string back into variables
+            CUR_DAY=$(echo "$CHOICE" | awk -F' @ ' '{print $1}')
+            CUR_TIME=$(echo "$CHOICE" | awk -F' @ ' '{print $2}')
+            CUR_PROF=$(grep "^${CUR_DAY}|${CUR_TIME}|" "$CONF" | head -n1 | cut -d'|' -f3)
+
+            ACTION=$(zenity --question --title="Manage Slot" \
+                --text="Selected: $CUR_DAY at $CUR_TIME -> $CUR_PROF\n\nWhat would you like to do?" \
                 --ok-label="Edit Slot" \
                 --cancel-label="Cancel" \
                 --extra-button="Delete Slot")
 
             RET=$?
             if [[ "$ACTION" == "Delete Slot" ]]; then
-                grep -v "^${CHOICE}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+                grep -v "^${CUR_DAY}|${CUR_TIME}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
             elif [[ $RET -eq 0 ]]; then
                 PROF_LIST=$(get_profiles "$CUR_PROF")
-                EDIT_ENTRY=$(zenity --forms --title="Edit Slot ($CHOICE)" \
-                    --text="Update the start time (leave blank to keep $CHOICE) or select a profile:" \
-                    --add-entry="New Start Time ($CHOICE):" \
-                    --add-combo="Select Profile (Current: $CUR_PROF):" --combo-values="$PROF_LIST")
+                DAY_LIST="$CUR_DAY|Everyday|Weekdays (Mon-Fri)|Weekends (Sat-Sun)|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday"
+
+                EDIT_ENTRY=$(zenity --forms --title="Edit Slot" \
+                    --text="Update settings (leave time blank to keep $CUR_TIME):" \
+                    --add-combo="Active Days:" --combo-values="$DAY_LIST" \
+                    --add-entry="Start Time (Current: $CUR_TIME):" \
+                    --add-combo="Select Profile:" --combo-values="$PROF_LIST")
 
                 if [[ -n "$EDIT_ENTRY" ]]; then
-                    NT=$(echo "$EDIT_ENTRY" | cut -d'|' -f1 | tr -d ' ')
-                    NP=$(echo "$EDIT_ENTRY" | cut -d'|' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    [[ -z "$NT" ]] && NT="$CHOICE"
-                    [[ -z "$NP" ]] && NP="$CUR_PROF"
+                    ND=$(echo "$EDIT_ENTRY" | cut -d'|' -f1)
+                    NT=$(echo "$EDIT_ENTRY" | cut -d'|' -f2 | tr -d ' ')
+                    NP=$(echo "$EDIT_ENTRY" | cut -d'|' -f3 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    
+                    [[ -z "$NT" ]] && NT="$CUR_TIME"
+                    
                     if [[ "$NT" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
                         [[ ${#NT} -eq 4 ]] && NT="0$NT"
-                        grep -v "^${CHOICE}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
-                        echo "${NT}|${NP}" >> "$CONF"
+                        grep -v "^${CUR_DAY}|${CUR_TIME}|" "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+                        echo "${ND}|${NT}|${NP}" >> "$CONF"
                         sort_conf
                     else
-                        zenity --error --text="Invalid time format! Must be HH:MM."
+                        zenity --error --text="Invalid time format!"
                     fi
                 fi
             fi
@@ -127,24 +144,53 @@ if [[ "$1" == "--gui" ]]; then
     done
 fi
 
-to_int() { echo "$((10#${1//[^0-9]/}))"; }
+# 3. Weekly Time Evaluation Logic (Converts everything to absolute minute of the week)
+DAY_IDX=$(( $(date +%u) - 1 )) # 0=Mon, 6=Sun
 
 if [[ -n "$1" && "$1" != "--gui" ]]; then
-    NOW=$(to_int "$1")
-    rm -f "$STATE"
+    NOW_H=${1:0:2}
+    NOW_M=${1:2:2}
 else
-    NOW=$((10#$(date +%H%M)))
+    NOW_H=$(date +%H)
+    NOW_M=$(date +%M)
 fi
+CUR_MIN=$(( DAY_IDX * 1440 + 10#$NOW_H * 60 + 10#$NOW_M ))
 
-PROFILE=$(tail -n 1 "$CONF" | cut -d'|' -f2)
+> /tmp/openrgb_week.tmp
+while IFS='|' read -r days t p; do
+    mins=$(( 10#${t%:*} * 60 + 10#${t#*:} ))
+    
+    # Map the dropdown choices to numerical days of the week (0=Mon, 6=Sun)
+    case "$days" in
+        "Everyday") d_list="0 1 2 3 4 5 6" ;;
+        "Weekdays (Mon-Fri)") d_list="0 1 2 3 4" ;;
+        "Weekends (Sat-Sun)") d_list="5 6" ;;
+        "Monday") d_list="0" ;;
+        "Tuesday") d_list="1" ;;
+        "Wednesday") d_list="2" ;;
+        "Thursday") d_list="3" ;;
+        "Friday") d_list="4" ;;
+        "Saturday") d_list="5" ;;
+        "Sunday") d_list="6" ;;
+        *) d_list="" ;;
+    esac
 
-while IFS='|' read -r t p; do
-    [[ -z "$t" ]] && continue
-    SLOT_TIME=$(to_int "$t")
-    if (( NOW >= SLOT_TIME )); then
+    for d in $d_list; do
+        echo "$(( d * 1440 + mins ))|$p" >> /tmp/openrgb_week.tmp
+    done
+done < "$CONF"
+
+# Sort the weekly timeline chronologically
+sort -n -t'|' -k1,1 /tmp/openrgb_week.tmp > /tmp/openrgb_week_sorted.tmp
+
+# Find the active profile (defaults to the latest profile in the whole week for Sunday->Monday overnight wrapping)
+PROFILE=$(tail -n 1 /tmp/openrgb_week_sorted.tmp | cut -d'|' -f2)
+
+while IFS='|' read -r slot_min p; do
+    if (( CUR_MIN >= slot_min )); then
         PROFILE="$p"
     fi
-done < "$CONF"
+done < /tmp/openrgb_week_sorted.tmp
 
 [[ -z "$PROFILE" ]] && exit 0
 
